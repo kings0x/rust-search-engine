@@ -1,7 +1,5 @@
 mod server;
-mod storage;
-
-use std::collections::{HashMap, VecDeque};
+use search_engine::storage;
 use std::path::Path;
 
 #[tokio::main]

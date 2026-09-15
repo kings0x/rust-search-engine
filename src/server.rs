@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::storage::ingest;
 use anyhow::Result;
+use search_engine::storage::ingest;
 
 const MERGE_INTERVAL_SECS: u64 = 30;
 const MERGE_THRESHOLD: usize = 10;
@@ -24,9 +24,7 @@ impl Server {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(MERGE_INTERVAL_SECS)).await;
                 if let Err(e) = try_merge(&output_dir).await {
-                    if e.to_string() != "No segments to merge" {
-                        eprintln!("background merge error: {e}");
-                    }
+                    eprintln!("background merge error: {e}");
                 }
             }
         });
@@ -43,22 +41,26 @@ impl Server {
 async fn try_merge(output_dir: &Path) -> Result<()> {
     let segments = ingest::read_manifest(output_dir)?;
     if segments.len() <= MERGE_THRESHOLD {
-        return Err(anyhow::anyhow!("No segments to merge"));
+        return Ok(());
     }
 
     // Pick smallest segments by doc_count, merge half of them
-    let mut to_merge: Vec<_> = segments.iter().cloned().collect();
+    let mut to_merge = segments.to_vec();
     to_merge.sort_by_key(|s| s.doc_count);
     let merge_count = to_merge.len() / 2;
     let to_merge: Vec<_> = to_merge.drain(..merge_count).collect();
 
-    let new_seg_id = segments.last().unwrap().seg_id + 1;
+    let new_seg_id = segments
+        .iter()
+        .map(|segment| segment.seg_id)
+        .max()
+        .unwrap_or(0)
+        + 1;
 
     let new_seg = ingest::merge_segments_background(output_dir, &to_merge, new_seg_id)?;
 
     // Build new manifest: exclude old segments, add new one
-    let merged_ids: std::collections::HashSet<_> =
-        to_merge.iter().map(|s| s.seg_id).collect();
+    let merged_ids: std::collections::HashSet<_> = to_merge.iter().map(|s| s.seg_id).collect();
     let mut new_manifest: Vec<_> = segments
         .iter()
         .filter(|s| !merged_ids.contains(&s.seg_id))

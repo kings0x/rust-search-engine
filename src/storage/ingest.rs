@@ -1,6 +1,5 @@
-use anyhow::Result;
-use regex::Regex;
-use rust_stemmers::{Algorithm, Stemmer};
+use crate::analysis::analyze;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,93 +10,78 @@ use walkdir::WalkDir;
 
 const MAX_CONCURRENT_TASKS: usize = 128;
 const SPAWN_BACKPRESSURE: usize = MAX_CONCURRENT_TASKS * 4;
-
 const MAX_MEMORY_TERMS: usize = 500_000;
 const MEMORY_CHECK_INTERVAL: usize = 50;
-
 const STREAM_THRESHOLD: u64 = 64 * 1024 * 1024;
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 const STREAM_PERMIT_COST: u32 = 1;
 const MAX_MEMORY_MB: u32 = 2048;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posting {
     pub doc_id: u32,
     pub frequency: u32,
     pub positions: Vec<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocMeta {
+    pub doc_id: u32,
     pub path: String,
     pub length: u32,
 }
 
-type PerDocPostings = HashMap<String, (u32, Vec<u32>)>;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMeta {
     pub seg_id: u32,
     pub start_doc_id: u32,
     pub doc_count: u32,
 }
 
-fn tokenize_text(text: &str) -> PerDocPostings {
-    let re = Regex::new(r"[^a-zA-Z0-9\s]+").unwrap();
-    let stemmer = Stemmer::create(Algorithm::English);
-    let cleaned = re.replace_all(text, " ");
-    let mut postings: PerDocPostings = HashMap::new();
+type PerDocPostings = HashMap<String, (u32, Vec<u32>)>;
+type ProcessedDocument = (String, u32, PerDocPostings);
 
-    for (pos, word) in cleaned.split_whitespace().enumerate() {
-        let stemmed = stemmer.stem(word).to_string();
-        let entry = postings.entry(stemmed).or_insert((0, Vec::new()));
+fn postings_from_terms(terms: &[String], starting_position: u32) -> PerDocPostings {
+    let mut postings = HashMap::new();
+    for (offset, term) in terms.iter().enumerate() {
+        let entry = postings.entry(term.clone()).or_insert((0, Vec::new()));
         entry.0 += 1;
-        entry.1.push(pos as u32);
+        entry.1.push(starting_position + offset as u32);
     }
-
     postings
 }
 
-async fn process_file_bulk(path: &Path) -> Result<(DocMeta, PerDocPostings)> {
+async fn process_file_bulk(path: &Path) -> Result<ProcessedDocument> {
     let contents = tokio::fs::read_to_string(path).await?;
-    let word_count = contents.split_whitespace().count() as u32;
-    let postings = tokenize_text(&contents);
-    let meta = DocMeta {
-        path: path.to_string_lossy().to_string(),
-        length: word_count,
-    };
-    Ok((meta, postings))
+    let terms = analyze(&contents);
+    let length = terms.len() as u32;
+    let postings = postings_from_terms(&terms, 0);
+    Ok((path.to_string_lossy().to_string(), length, postings))
 }
 
-async fn process_file_stream(path: &Path) -> Result<(DocMeta, PerDocPostings)> {
+async fn process_file_stream(path: &Path) -> Result<ProcessedDocument> {
     let file = tokio::fs::File::open(path).await?;
     let reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
     let mut lines = reader.lines();
-
     let mut postings: PerDocPostings = HashMap::new();
-    let mut global_pos: u32 = 0;
-    let re = Regex::new(r"[^a-zA-Z0-9\s]+").unwrap();
-    let stemmer = Stemmer::create(Algorithm::English);
+    let mut global_position = 0_u32;
 
     while let Some(line) = lines.next_line().await? {
-        let cleaned = re.replace_all(&line, " ");
-        for word in cleaned.split_whitespace() {
-            let stemmed = stemmer.stem(word).to_string();
-            let entry = postings.entry(stemmed).or_insert((0, Vec::new()));
-            entry.0 += 1;
-            entry.1.push(global_pos);
-            global_pos += 1;
+        let terms = analyze(&line);
+        for (term, (frequency, mut positions)) in postings_from_terms(&terms, global_position) {
+            let entry = postings.entry(term).or_insert((0, Vec::new()));
+            entry.0 += frequency;
+            entry.1.append(&mut positions);
         }
+        global_position += terms.len() as u32;
     }
 
-    let meta = DocMeta {
-        path: path.to_string_lossy().to_string(),
-        length: global_pos,
-    };
-    Ok((meta, postings))
+    Ok((
+        path.to_string_lossy().to_string(),
+        global_position,
+        postings,
+    ))
 }
-
-// ── Segment writer ──
 
 fn write_segment_to_disk(
     seg_id: u32,
@@ -107,56 +91,63 @@ fn write_segment_to_disk(
 ) -> Result<()> {
     use std::io::Write;
 
-    let prefix = output_dir.join(format!("seg_{}", seg_id));
+    let prefix = output_dir.join(format!("seg_{seg_id}"));
+    let mut sorted_terms: Vec<&String> = vocabulary.keys().collect();
+    sorted_terms.sort();
 
-    let mut sorted: Vec<&String> = vocabulary.keys().collect();
-    sorted.sort();
+    let mut postings_file = std::fs::File::create(prefix.with_extension("postings.txt"))?;
+    let mut offsets_file = std::fs::File::create(prefix.with_extension("offsets.txt"))?;
+    let mut vocabulary_file = std::fs::File::create(prefix.with_extension("alphas.txt"))?;
 
-    let mut pf = std::fs::File::create(prefix.with_extension("postings.txt"))?;
-    let mut of = std::fs::File::create(prefix.with_extension("offsets.txt"))?;
-    let mut af = std::fs::File::create(prefix.with_extension("alphas.txt"))?;
+    for term in sorted_terms {
+        let mut postings = vocabulary[term].clone();
+        postings.sort_by_key(|posting| posting.doc_id);
 
-    for term in &sorted {
-        let postings = &vocabulary[*term];
+        let offset = postings_file.metadata()?.len();
+        writeln!(offsets_file, "{offset}")?;
 
-        let mut line = String::new();
-        line.push_str(term);
-        line.push('|');
-        for (i, p) in postings.iter().enumerate() {
-            if i > 0 {
-                line.push(';');
+        write!(postings_file, "{term}|")?;
+        for (index, posting) in postings.iter().enumerate() {
+            if index > 0 {
+                write!(postings_file, ";")?;
             }
-            line.push_str(&format!("{},{}", p.doc_id, p.frequency));
-            for pos in &p.positions {
-                line.push(',');
-                line.push_str(&pos.to_string());
+            write!(postings_file, "{},{}", posting.doc_id, posting.frequency)?;
+            for position in &posting.positions {
+                write!(postings_file, ",{position}")?;
             }
         }
-        line.push('\n');
+        writeln!(postings_file)?;
 
-        let offset = pf.metadata()?.len();
-        writeln!(of, "{}", offset)?;
-        let doc_freq = postings.len();
-        let total_freq: u32 = postings.iter().map(|p| p.frequency).sum();
-        writeln!(af, "{}:{}:{}", term, doc_freq, total_freq)?;
-        pf.write_all(line.as_bytes())?;
+        let total_frequency: u32 = postings.iter().map(|posting| posting.frequency).sum();
+        writeln!(
+            vocabulary_file,
+            "{}:{}:{}",
+            term,
+            postings.len(),
+            total_frequency
+        )?;
     }
 
-    let mut df = std::fs::File::create(prefix.with_extension("docs.txt"))?;
-    for doc in docs {
-        writeln!(df, "{}|{}", doc.path, doc.length)?;
+    let mut docs_file = std::fs::File::create(prefix.with_extension("docs.txt"))?;
+    let mut sorted_docs = docs.to_vec();
+    sorted_docs.sort_by_key(|document| document.doc_id);
+    for document in sorted_docs {
+        writeln!(
+            docs_file,
+            "{}\t{}\t{}",
+            document.doc_id, document.length, document.path
+        )?;
     }
 
     Ok(())
 }
-
-// ── Manifest ──
 
 pub fn read_manifest(output_dir: &Path) -> Result<Vec<SegmentMeta>> {
     let path = output_dir.join("manifest.txt");
     if !path.exists() {
         return Ok(Vec::new());
     }
+
     let content = std::fs::read_to_string(&path)?;
     let mut segments = Vec::new();
     for line in content.lines() {
@@ -172,54 +163,105 @@ pub fn read_manifest(output_dir: &Path) -> Result<Vec<SegmentMeta>> {
     Ok(segments)
 }
 
-fn read_indexed_paths(output_dir: &Path) -> Result<Vec<String>> {
-    let segments = read_manifest(output_dir)?;
-    let mut paths = Vec::new();
-    for seg in &segments {
-        let path = output_dir.join(format!("seg_{}.docs.txt", seg.seg_id));
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines() {
-                if let Some(path_part) = line.split('|').next() {
-                    paths.push(path_part.to_string());
-                }
-            }
+pub fn read_segment_docs(output_dir: &Path, segment: &SegmentMeta) -> Result<Vec<DocMeta>> {
+    let path = output_dir.join(format!("seg_{}.docs.txt", segment.seg_id));
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut documents = Vec::new();
+
+    for (line_index, line) in content.lines().enumerate() {
+        let tab_parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if tab_parts.len() == 3 {
+            documents.push(DocMeta {
+                doc_id: tab_parts[0].parse()?,
+                length: tab_parts[1].parse()?,
+                path: tab_parts[2].to_string(),
+            });
+        } else if let Some((path, length)) = line.rsplit_once('|') {
+            documents.push(DocMeta {
+                doc_id: segment.start_doc_id + line_index as u32,
+                length: length.parse()?,
+                path: path.to_string(),
+            });
         }
+    }
+
+    Ok(documents)
+}
+
+fn parse_postings_line(line: &str) -> Result<(String, Vec<Posting>)> {
+    let (term, encoded_postings) = line
+        .split_once('|')
+        .with_context(|| format!("invalid postings line for {line}"))?;
+    let mut postings = Vec::new();
+
+    if encoded_postings.is_empty() {
+        return Ok((term.to_string(), postings));
+    }
+
+    for encoded_posting in encoded_postings.split(';') {
+        let mut values = encoded_posting.split(',');
+        let doc_id = values.next().context("missing document ID")?.parse()?;
+        let frequency = values.next().context("missing term frequency")?.parse()?;
+        let positions = values.map(str::parse).collect::<Result<Vec<u32>, _>>()?;
+        postings.push(Posting {
+            doc_id,
+            frequency,
+            positions,
+        });
+    }
+
+    Ok((term.to_string(), postings))
+}
+
+pub fn read_segment_postings(
+    output_dir: &Path,
+    segment_id: u32,
+) -> Result<HashMap<String, Vec<Posting>>> {
+    let path = output_dir.join(format!("seg_{segment_id}.postings.txt"));
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    content
+        .lines()
+        .map(parse_postings_line)
+        .collect::<Result<HashMap<_, _>>>()
+}
+
+fn read_indexed_paths(output_dir: &Path, segments: &[SegmentMeta]) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for segment in segments {
+        paths.extend(
+            read_segment_docs(output_dir, segment)?
+                .into_iter()
+                .map(|document| document.path),
+        );
     }
     Ok(paths)
 }
 
 pub fn write_manifest(segments: &[SegmentMeta], output_dir: &Path) -> Result<()> {
-    use std::io::Write;
-    let path = output_dir.join("manifest.txt");
-    let mut file = std::fs::File::create(&path)?;
-    for seg in segments {
-        writeln!(
-            file,
-            "{} {} {}",
-            seg.seg_id, seg.start_doc_id, seg.doc_count
-        )?;
-    }
-    Ok(())
+    write_manifest_to(output_dir.join("manifest.txt"), segments)
 }
 
 pub fn write_manifest_atomic(segments: &[SegmentMeta], output_dir: &Path) -> Result<()> {
-    use std::io::Write;
-    let tmp = output_dir.join("manifest.tmp");
-    let final_path = output_dir.join("manifest.txt");
-    let mut file = std::fs::File::create(&tmp)?;
-    for seg in segments {
-        writeln!(
-            file,
-            "{} {} {}",
-            seg.seg_id, seg.start_doc_id, seg.doc_count
-        )?;
-    }
-    drop(file);
-    std::fs::rename(&tmp, &final_path)?;
+    let temporary_path = output_dir.join("manifest.tmp");
+    write_manifest_to(temporary_path.clone(), segments)?;
+    std::fs::rename(temporary_path, output_dir.join("manifest.txt"))?;
     Ok(())
 }
 
-// ── Memory-managed builder ──
+fn write_manifest_to(path: PathBuf, segments: &[SegmentMeta]) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    for segment in segments {
+        writeln!(
+            file,
+            "{} {} {}",
+            segment.seg_id, segment.start_doc_id, segment.doc_count
+        )?;
+    }
+    Ok(())
+}
 
 struct IndexBuilder {
     docs: Vec<DocMeta>,
@@ -232,33 +274,50 @@ struct IndexBuilder {
 }
 
 impl IndexBuilder {
-    fn new(output_dir: &Path, existing: &[SegmentMeta]) -> Self {
-        let next_doc_id = existing
-            .last()
-            .map(|s| s.start_doc_id + s.doc_count)
-            .unwrap_or(0);
-        let next_seg_id = existing.last().map(|s| s.seg_id + 1).unwrap_or(0);
+    fn new(output_dir: &Path, existing: &[SegmentMeta]) -> Result<Self> {
+        let mut maximum_doc_id = None;
+        for segment in existing {
+            for document in read_segment_docs(output_dir, segment)? {
+                maximum_doc_id = Some(
+                    maximum_doc_id
+                        .map_or(document.doc_id, |current: u32| current.max(document.doc_id)),
+                );
+            }
+        }
 
-        Self {
+        Ok(Self {
             docs: Vec::new(),
             vocabulary: HashMap::new(),
-            next_doc_id,
-            next_seg_id,
+            next_doc_id: maximum_doc_id.map_or(0, |id| id + 1),
+            next_seg_id: existing
+                .iter()
+                .map(|segment| segment.seg_id)
+                .max()
+                .map_or(0, |id| id + 1),
             docs_since_last_check: 0,
             output_dir: output_dir.to_path_buf(),
             new_segments: Vec::new(),
-        }
+        })
     }
 
-    fn merge_document(&mut self, meta: DocMeta, postings: PerDocPostings) -> Result<()> {
+    fn merge_document(
+        &mut self,
+        path: String,
+        length: u32,
+        postings: PerDocPostings,
+    ) -> Result<()> {
         let doc_id = self.next_doc_id;
         self.next_doc_id += 1;
-        self.docs.push(meta);
+        self.docs.push(DocMeta {
+            doc_id,
+            path,
+            length,
+        });
 
-        for (term, (freq, positions)) in postings {
+        for (term, (frequency, positions)) in postings {
             self.vocabulary.entry(term).or_default().push(Posting {
                 doc_id,
-                frequency: freq,
+                frequency,
                 positions,
             });
         }
@@ -278,9 +337,13 @@ impl IndexBuilder {
         }
 
         let seg_id = self.next_seg_id;
+        let start_doc_id = self
+            .docs
+            .iter()
+            .map(|document| document.doc_id)
+            .min()
+            .unwrap_or(0);
         let doc_count = self.docs.len() as u32;
-        let start_doc_id = self.next_doc_id - doc_count;
-
         write_segment_to_disk(seg_id, &self.docs, &self.vocabulary, &self.output_dir)?;
 
         self.new_segments.push(SegmentMeta {
@@ -288,7 +351,6 @@ impl IndexBuilder {
             start_doc_id,
             doc_count,
         });
-
         self.next_seg_id += 1;
         self.vocabulary.clear();
         self.docs.clear();
@@ -298,91 +360,76 @@ impl IndexBuilder {
 
     fn finalize(mut self, existing: Vec<SegmentMeta>) -> Result<Vec<SegmentMeta>> {
         self.flush_segment()?;
-        let mut all = existing;
-        all.extend(self.new_segments);
-        Ok(all)
+        let mut all_segments = existing;
+        all_segments.extend(self.new_segments);
+        all_segments.sort_by_key(|segment| segment.seg_id);
+        Ok(all_segments)
     }
 }
 
 pub async fn build_index(root: &Path, output_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
-
     let existing = read_manifest(output_dir)?;
-    eprintln!(
-        "indexing {:?} -> {:?} ({} existing segments)",
-        root,
-        output_dir,
-        existing.len()
-    );
+    let indexed_paths = read_indexed_paths(output_dir, &existing)?;
+    let indexed_paths: std::collections::HashSet<String> = indexed_paths.into_iter().collect();
 
-    let indexed = read_indexed_paths(output_dir)?;
-    let indexed_set: std::collections::HashSet<String> = indexed.into_iter().collect();
-
-    let mem_sem = Arc::new(Semaphore::new(MAX_MEMORY_MB as usize));
-    let task_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS));
-    let mut tasks: JoinSet<Result<(DocMeta, PerDocPostings)>> = JoinSet::new();
-    let builder = std::sync::Mutex::new(IndexBuilder::new(output_dir, &existing));
+    let memory_semaphore = Arc::new(Semaphore::new(MAX_MEMORY_MB as usize));
+    let task_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS));
+    let mut tasks: JoinSet<Result<ProcessedDocument>> = JoinSet::new();
+    let builder = std::sync::Mutex::new(IndexBuilder::new(output_dir, &existing)?);
 
     let walker = WalkDir::new(root)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file());
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file());
 
     for entry in walker {
-        let path_str = entry.path().to_string_lossy().to_string();
-        if indexed_set.contains(&path_str) {
-            eprintln!("skipping already indexed: {}", path_str);
+        let path_string = entry.path().to_string_lossy().to_string();
+        if indexed_paths.contains(&path_string) {
             continue;
         }
+
         let path = entry.path().to_path_buf();
         let size = match entry.metadata() {
-            Ok(m) => m.len(),
-            Err(e) => {
-                eprintln!("skipping {}: metadata error: {e}", path.display());
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                eprintln!("skipping {}: metadata error: {error}", path.display());
                 continue;
             }
         };
-
-        let mem_sem = mem_sem.clone();
-        let task_sem = task_sem.clone();
+        let memory_semaphore = memory_semaphore.clone();
+        let task_semaphore = task_semaphore.clone();
 
         tasks.spawn(async move {
-            let _task_permit = task_sem.acquire().await?;
-
+            let _task_permit = task_semaphore.acquire().await?;
             if size >= STREAM_THRESHOLD {
-                let _mem = mem_sem.acquire_many(STREAM_PERMIT_COST).await?;
+                let _memory_permit = memory_semaphore.acquire_many(STREAM_PERMIT_COST).await?;
                 process_file_stream(&path)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+                    .with_context(|| format!("failed to process {}", path.display()))
             } else {
-                let permits = ((size / (1024 * 1024)) as u32).max(1).min(MAX_MEMORY_MB);
-                let _mem = mem_sem.acquire_many(permits).await?;
+                let permits = ((size / (1024 * 1024)) as u32).clamp(1, MAX_MEMORY_MB);
+                let _memory_permit = memory_semaphore.acquire_many(permits).await?;
                 process_file_bulk(&path)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+                    .with_context(|| format!("failed to process {}", path.display()))
             }
         });
 
         while tasks.len() >= SPAWN_BACKPRESSURE {
-            if let Some(res) = tasks.join_next().await {
-                ingest_result(res, &builder)?;
+            if let Some(result) = tasks.join_next().await {
+                ingest_result(result, &builder)?;
             }
         }
     }
 
-    while let Some(res) = tasks.join_next().await {
-        ingest_result(res, &builder)?;
+    while let Some(result) = tasks.join_next().await {
+        ingest_result(result, &builder)?;
     }
 
     let all_segments = builder.into_inner().unwrap().finalize(existing)?;
     write_manifest(&all_segments, output_dir)?;
-    eprintln!("done — {} segments", all_segments.len());
     Ok(())
-}
-
-struct SegReader {
-    reader: std::io::BufReader<std::fs::File>,
-    current_line: Option<String>,
 }
 
 pub fn merge_segments_background(
@@ -390,136 +437,68 @@ pub fn merge_segments_background(
     segments: &[SegmentMeta],
     new_seg_id: u32,
 ) -> Result<SegmentMeta> {
-    use std::io::{BufRead, Write};
+    let mut all_documents = Vec::new();
+    let mut vocabulary: HashMap<String, Vec<Posting>> = HashMap::new();
 
-    // Collect all docs from input segments
-    let mut all_docs: Vec<DocMeta> = Vec::new();
-    for seg in segments {
-        let path = output_dir.join(format!("seg_{}.docs.txt", seg.seg_id));
-        let content = std::fs::read_to_string(&path)?;
-        for line in content.lines() {
-            if let Some((path_part, len_part)) = line.split_once('|') {
-                all_docs.push(DocMeta {
-                    path: path_part.to_string(),
-                    length: len_part.parse()?,
-                });
-            }
+    for segment in segments {
+        all_documents.extend(read_segment_docs(output_dir, segment)?);
+        for (term, mut postings) in read_segment_postings(output_dir, segment.seg_id)? {
+            vocabulary.entry(term).or_default().append(&mut postings);
         }
     }
 
-    // Open all input postings files
-    let mut seg_readers: Vec<SegReader> = Vec::new();
-    for seg in segments {
-        let path = output_dir.join(format!("seg_{}.postings.txt", seg.seg_id));
-        let file = std::fs::File::open(&path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut buf = String::new();
-        let current_line = if reader.read_line(&mut buf)? > 0 {
-            if buf.ends_with('\n') {
-                buf.pop();
-            }
-            Some(buf)
-        } else {
-            None
-        };
-        seg_readers.push(SegReader {
-            reader,
-            current_line,
-        });
+    all_documents.sort_by_key(|document| document.doc_id);
+    for postings in vocabulary.values_mut() {
+        postings.sort_by_key(|posting| posting.doc_id);
     }
-
-    // Open output files for the merged segment
-    let prefix = output_dir.join(format!("seg_{}", new_seg_id));
-    let mut out_pf = std::fs::File::create(prefix.with_extension("postings.txt"))?;
-    let mut out_of = std::fs::File::create(prefix.with_extension("offsets.txt"))?;
-    let mut out_af = std::fs::File::create(prefix.with_extension("alphas.txt"))?;
-
-    loop {
-        // Find the smallest term across all active readers
-        let min_term = seg_readers
-            .iter()
-            .filter_map(|sr| sr.current_line.as_ref())
-            .map(|line| line.split('|').next().unwrap())
-            .min()
-            .map(|s| s.to_string());
-
-        let Some(ref min_term) = min_term else { break };
-
-        let mut combined = min_term.clone();
-        combined.push('|');
-        let mut first_posting = true;
-        let mut doc_freq: u32 = 0;
-        let mut total_freq: u32 = 0;
-
-        for sr in &mut seg_readers {
-            let Some(ref line) = sr.current_line else {
-                continue;
-            };
-            if line.split('|').next().unwrap() != min_term {
-                continue;
-            }
-
-            if let Some(right) = line.split('|').nth(1) {
-                for posting_str in right.split(';') {
-                    if !first_posting {
-                        combined.push(';');
-                    }
-                    first_posting = false;
-                    combined.push_str(posting_str);
-
-                    let parts: Vec<&str> = posting_str.split(',').collect();
-                    if parts.len() >= 2 {
-                        doc_freq += 1;
-                        total_freq += parts[1].parse::<u32>().unwrap_or(0);
-                    }
-                }
-            }
-
-            // Advance this reader
-            let mut buf = String::new();
-            sr.current_line = if sr.reader.read_line(&mut buf)? > 0 {
-                if buf.ends_with('\n') {
-                    buf.pop();
-                }
-                Some(buf)
-            } else {
-                None
-            };
-        }
-
-        combined.push('\n');
-
-        let offset = out_pf.metadata()?.len();
-        writeln!(out_of, "{}", offset)?;
-        writeln!(out_af, "{}:{}:{}", min_term, doc_freq, total_freq)?;
-        out_pf.write_all(combined.as_bytes())?;
-    }
-
-    let mut out_df = std::fs::File::create(prefix.with_extension("docs.txt"))?;
-    for doc in &all_docs {
-        writeln!(out_df, "{}|{}", doc.path, doc.length)?;
-    }
-
-    let start_doc_id = segments.first().unwrap().start_doc_id;
-    let doc_count: u32 = segments.iter().map(|s| s.doc_count).sum();
+    write_segment_to_disk(new_seg_id, &all_documents, &vocabulary, output_dir)?;
 
     Ok(SegmentMeta {
         seg_id: new_seg_id,
-        start_doc_id,
-        doc_count,
+        start_doc_id: all_documents.first().map_or(0, |document| document.doc_id),
+        doc_count: all_documents.len() as u32,
     })
 }
 
 fn ingest_result(
-    res: std::result::Result<Result<(DocMeta, PerDocPostings)>, tokio::task::JoinError>,
+    result: std::result::Result<Result<ProcessedDocument>, tokio::task::JoinError>,
     builder: &std::sync::Mutex<IndexBuilder>,
 ) -> Result<()> {
-    match res {
-        Ok(Ok((meta, postings))) => {
-            builder.lock().unwrap().merge_document(meta, postings)?;
+    match result {
+        Ok(Ok((path, length, postings))) => {
+            builder
+                .lock()
+                .unwrap()
+                .merge_document(path, length, postings)?;
         }
-        Ok(Err(e)) => eprintln!("task error: {e}"),
-        Err(e) => eprintln!("task panicked: {e}"),
+        Ok(Err(error)) => eprintln!("indexing task error: {error:#}"),
+        Err(error) => eprintln!("indexing task panicked: {error}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_index, read_manifest, read_segment_docs};
+    use crate::search::SearchIndex;
+
+    #[tokio::test]
+    async fn writes_reloadable_documents_with_consistent_lengths() {
+        let input = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        std::fs::write(
+            input.path().join("one.txt"),
+            "Building search engines with Rust.",
+        )
+        .unwrap();
+
+        build_index(input.path(), output.path()).await.unwrap();
+        let segments = read_manifest(output.path()).unwrap();
+        let documents = read_segment_docs(output.path(), &segments[0]).unwrap();
+        let index = SearchIndex::load(output.path()).unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].length, 5);
+        assert_eq!(index.search("build engine", 10).hits.len(), 1);
+    }
 }

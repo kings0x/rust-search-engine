@@ -9,3 +9,7 @@ walkdir = "2.5.0"
 anyhow = "1.0.103"
 regex = "1.11.1"
 rust-stemmers = "1.2.0"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
