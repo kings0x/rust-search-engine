@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rust Search Engine</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --background: #0d1117;
+        --surface: #151b23;
+        --surface-raised: #1c2430;
+        --border: #2d3745;
+        --text: #f0f6fc;
+        --muted: #8b98a8;
+        --accent: #f59e0b;
+        --accent-strong: #fbbf24;
+        --success: #34d399;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at 20% 0%, rgba(245, 158, 11, 0.13), transparent 32rem),
+          var(--background);
+        color: var(--text);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      main {
+        width: min(920px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 72px 0;
+      }
+
+      .eyebrow {
+        margin: 0 0 12px;
+        color: var(--accent-strong);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        max-width: 760px;
+        font-size: clamp(38px, 7vw, 72px);
+        line-height: 0.98;
+        letter-spacing: -0.055em;
+      }
+
+      .intro {
+        max-width: 680px;
+        margin: 22px 0 32px;
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.65;
+      }
+
+      form {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        padding: 8px;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: rgba(21, 27, 35, 0.88);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(12px);
+      }
+
+      input, button { font: inherit; }
+
+      input {
+        min-width: 0;
+        border: 0;
+        outline: 0;
+        padding: 14px 16px;
+        background: transparent;
+        color: var(--text);
+        font-size: 17px;
+      }
+
+      input::placeholder { color: #637083; }
+
+      button {
+        border: 0;
+        border-radius: 11px;
+        padding: 13px 22px;
+        background: var(--accent);
+        color: #1a1205;
+        cursor: pointer;
+        font-weight: 750;
+      }
+
+      button:hover { background: var(--accent-strong); }
+      button:disabled { cursor: wait; opacity: 0.65; }
+
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 20px;
+        margin: 16px 4px 36px;
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+      }
+
+      .stats strong { color: var(--text); font-weight: 600; }
+
+      .status {
+        min-height: 24px;
+        margin-bottom: 14px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .results { display: grid; gap: 12px; }
+
+      article {
+        padding: 20px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: var(--surface);
+        transition: border-color 150ms ease, transform 150ms ease;
+      }
+
+      article:hover {
+        border-color: #4b586a;
+        transform: translateY(-1px);
+      }
+
+      .result-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .path {
+        overflow-wrap: anywhere;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      .score {
+        flex: 0 0 auto;
+        color: var(--success);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+      }
+
+      .meta {
+        display: flex;
+        gap: 16px;
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .empty {
+        padding: 48px 20px;
+        border: 1px dashed var(--border);
+        border-radius: 14px;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      @media (max-width: 620px) {
+        main { padding-top: 44px; }
+        form { grid-template-columns: 1fr; }
+        button { width: 100%; }
+        .result-top { display: block; }
+        .score { display: block; margin-top: 10px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Built in Rust · Ranked with BM25</p>
+      <h1>Search your document corpus.</h1>
+      <p class="intro">
+        A compact search engine with stemming, positional inverted indexes,
+        persistent segments, and relevance ranking.
+      </p>
+
+      <form id="search-form">
+        <input id="query" name="q" type="search" autocomplete="off" autofocus
+          placeholder="Try: inverted index compression" aria-label="Search query" />
+        <button id="submit" type="submit">Search</button>
+      </form>
+
+      <div class="stats" id="stats">Loading index statistics…</div>
+      <div class="status" id="status">Enter a query to begin.</div>
+      <section class="results" id="results" aria-live="polite"></section>
+    </main>
+
+    <script>
+      const form = document.querySelector('#search-form');
+      const queryInput = document.querySelector('#query');
+      const submitButton = document.querySelector('#submit');
+      const statsElement = document.querySelector('#stats');
+      const statusElement = document.querySelector('#status');
+      const resultsElement = document.querySelector('#results');
+
+      const formatNumber = new Intl.NumberFormat();
+
+      async function loadStats() {
+        try {
+          const response = await fetch('/api/stats');
+          if (!response.ok) throw new Error('Could not load index statistics');
+          const stats = await response.json();
+          statsElement.replaceChildren(
+            stat(`${formatNumber.format(stats.documents)} documents`),
+            stat(`${formatNumber.format(stats.terms)} terms`),
+            stat(`${formatNumber.format(stats.postings)} postings`),
+            stat(`${Math.round(stats.average_document_length)} avg. tokens`),
+          );
+        } catch (error) {
+          statsElement.textContent = error.message;
+        }
+      }
+
+      function stat(text) {
+        const element = document.createElement('strong');
+        element.textContent = text;
+        return element;
+      }
+
+      function renderResults(payload) {
+        resultsElement.replaceChildren();
+        statusElement.textContent = `${formatNumber.format(payload.total_candidates)} candidates · ${payload.hits.length} shown · ${formatNumber.format(payload.took_micros)} µs · terms: ${payload.analyzed_terms.join(', ')}`;
+
+        if (payload.hits.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'empty';
+          empty.textContent = 'No matching documents found.';
+          resultsElement.append(empty);
+          return;
+        }
+
+        for (const hit of payload.hits) {
+          const article = document.createElement('article');
+          const top = document.createElement('div');
+          const path = document.createElement('div');
+          const score = document.createElement('span');
+          const meta = document.createElement('div');
+
+          top.className = 'result-top';
+          path.className = 'path';
+          score.className = 'score';
+          meta.className = 'meta';
+          path.textContent = hit.path;
+          score.textContent = `BM25 ${hit.score.toFixed(4)}`;
+          meta.textContent = `${hit.matched_terms} matched terms · ${formatNumber.format(hit.document_length)} tokens · document ${hit.doc_id}`;
+
+          top.append(path, score);
+          article.append(top, meta);
+          resultsElement.append(article);
+        }
+      }
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const query = queryInput.value.trim();
+        if (!query) return;
+
+        submitButton.disabled = true;
+        statusElement.textContent = 'Searching…';
+        resultsElement.replaceChildren();
+        history.replaceState(null, '', `?q=${encodeURIComponent(query)}`);
+
+        try {
+          const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=20`);
+          if (!response.ok) throw new Error(await response.text());
+          renderResults(await response.json());
+        } catch (error) {
+          statusElement.textContent = `Search failed: ${error.message}`;
+        } finally {
+          submitButton.disabled = false;
+        }
+      });
+
+      const initialQuery = new URLSearchParams(location.search).get('q');
+      if (initialQuery) {
+        queryInput.value = initialQuery;
+        form.requestSubmit();
+      }
+      loadStats();
+    </script>
+  </body>
+</html>
