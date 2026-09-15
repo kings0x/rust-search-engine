@@ -1,0 +1,11 @@
+[package]
+name = "search-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["full"] }
+walkdir = "2.5.0"
+anyhow = "1.0.103"
+regex = "1.11.1"
+rust-stemmers = "1.2.0"
