@@ -1,0 +1,9 @@
+# Replace or extend these with queries representative of your corpus.
+rust search engine
+inverted index
+document ranking
+bm25 relevance
+posting list compression
+query latency
+spelling correction
+concurrent indexing

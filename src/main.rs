@@ -17,13 +17,20 @@ async fn main() -> Result<()> {
         );
     }
 
-    storage::ingest::build_index(&input, &output)
+    let build = storage::ingest::build_index(&input, &output)
         .await
         .with_context(|| format!("failed to index {}", input.display()))?;
     let index = SearchIndex::load(&output)
         .with_context(|| format!("failed to load index from {}", output.display()))?;
 
     let stats = index.stats();
+    println!(
+        "indexed {} new documents in {} ms ({} already indexed, {} new segments)",
+        build.indexed_documents,
+        build.elapsed_millis,
+        build.previously_indexed_documents,
+        build.segments_written
+    );
     println!(
         "loaded {} documents, {} terms, and {} postings",
         stats.documents, stats.terms, stats.postings

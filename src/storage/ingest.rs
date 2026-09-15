@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -37,6 +38,14 @@ pub struct SegmentMeta {
     pub seg_id: u32,
     pub start_doc_id: u32,
     pub doc_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBuildReport {
+    pub indexed_documents: usize,
+    pub previously_indexed_documents: usize,
+    pub segments_written: usize,
+    pub elapsed_millis: u128,
 }
 
 type PerDocPostings = HashMap<String, (u32, Vec<u32>)>;
@@ -395,18 +404,29 @@ impl IndexBuilder {
         Ok(())
     }
 
-    fn finalize(mut self, existing: Vec<SegmentMeta>) -> Result<Vec<SegmentMeta>> {
+    fn finalize(mut self, existing: Vec<SegmentMeta>) -> Result<(Vec<SegmentMeta>, usize, usize)> {
         self.flush_segment()?;
+        let indexed_documents = self
+            .new_segments
+            .iter()
+            .map(|segment| segment.doc_count as usize)
+            .sum();
+        let segments_written = self.new_segments.len();
         let mut all_segments = existing;
         all_segments.extend(self.new_segments);
         all_segments.sort_by_key(|segment| segment.seg_id);
-        Ok(all_segments)
+        Ok((all_segments, indexed_documents, segments_written))
     }
 }
 
-pub async fn build_index(root: &Path, output_dir: &Path) -> Result<()> {
+pub async fn build_index(root: &Path, output_dir: &Path) -> Result<IndexBuildReport> {
+    let started = Instant::now();
     std::fs::create_dir_all(output_dir)?;
     let existing = read_manifest(output_dir)?;
+    let previously_indexed_documents = existing
+        .iter()
+        .map(|segment| segment.doc_count as usize)
+        .sum();
     let indexed_paths = read_indexed_paths(output_dir, &existing)?;
     let indexed_paths: std::collections::HashSet<String> = indexed_paths.into_iter().collect();
 
@@ -464,9 +484,15 @@ pub async fn build_index(root: &Path, output_dir: &Path) -> Result<()> {
         ingest_result(result, &builder)?;
     }
 
-    let all_segments = builder.into_inner().unwrap().finalize(existing)?;
+    let (all_segments, indexed_documents, segments_written) =
+        builder.into_inner().unwrap().finalize(existing)?;
     write_manifest(&all_segments, output_dir)?;
-    Ok(())
+    Ok(IndexBuildReport {
+        indexed_documents,
+        previously_indexed_documents,
+        segments_written,
+        elapsed_millis: started.elapsed().as_millis(),
+    })
 }
 
 pub fn merge_segments_background(
@@ -529,7 +555,12 @@ mod tests {
         )
         .unwrap();
 
-        build_index(input.path(), output.path()).await.unwrap();
+        let first_build = build_index(input.path(), output.path()).await.unwrap();
+        assert_eq!(first_build.indexed_documents, 1);
+        assert_eq!(first_build.previously_indexed_documents, 0);
+        let second_build = build_index(input.path(), output.path()).await.unwrap();
+        assert_eq!(second_build.indexed_documents, 0);
+        assert_eq!(second_build.previously_indexed_documents, 1);
         let segments = read_manifest(output.path()).unwrap();
         assert!(output.path().join("seg_0.postings.bin").exists());
         assert!(output.path().join("seg_0.lexicon.tsv").exists());
