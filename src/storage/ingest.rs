@@ -1,4 +1,5 @@
 use crate::analysis::analyze;
+use crate::storage::codec::{decode_postings, encode_postings};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -95,34 +96,23 @@ fn write_segment_to_disk(
     let mut sorted_terms: Vec<&String> = vocabulary.keys().collect();
     sorted_terms.sort();
 
-    let mut postings_file = std::fs::File::create(prefix.with_extension("postings.txt"))?;
-    let mut offsets_file = std::fs::File::create(prefix.with_extension("offsets.txt"))?;
-    let mut vocabulary_file = std::fs::File::create(prefix.with_extension("alphas.txt"))?;
+    let mut postings_file = std::fs::File::create(prefix.with_extension("postings.bin"))?;
+    let mut lexicon_file = std::fs::File::create(prefix.with_extension("lexicon.tsv"))?;
 
     for term in sorted_terms {
         let mut postings = vocabulary[term].clone();
         postings.sort_by_key(|posting| posting.doc_id);
 
         let offset = postings_file.metadata()?.len();
-        writeln!(offsets_file, "{offset}")?;
-
-        write!(postings_file, "{term}|")?;
-        for (index, posting) in postings.iter().enumerate() {
-            if index > 0 {
-                write!(postings_file, ";")?;
-            }
-            write!(postings_file, "{},{}", posting.doc_id, posting.frequency)?;
-            for position in &posting.positions {
-                write!(postings_file, ",{position}")?;
-            }
-        }
-        writeln!(postings_file)?;
-
+        let encoded = encode_postings(&postings);
+        postings_file.write_all(&encoded)?;
         let total_frequency: u32 = postings.iter().map(|posting| posting.frequency).sum();
         writeln!(
-            vocabulary_file,
-            "{}:{}:{}",
+            lexicon_file,
+            "{}\t{}\t{}\t{}\t{}",
             term,
+            offset,
+            encoded.len(),
             postings.len(),
             total_frequency
         )?;
@@ -218,13 +208,60 @@ pub fn read_segment_postings(
     output_dir: &Path,
     segment_id: u32,
 ) -> Result<HashMap<String, Vec<Posting>>> {
-    let path = output_dir.join(format!("seg_{segment_id}.postings.txt"));
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let binary_path = output_dir.join(format!("seg_{segment_id}.postings.bin"));
+    let lexicon_path = output_dir.join(format!("seg_{segment_id}.lexicon.tsv"));
+    if binary_path.exists() && lexicon_path.exists() {
+        return read_compressed_segment(&binary_path, &lexicon_path);
+    }
+
+    let legacy_path = output_dir.join(format!("seg_{segment_id}.postings.txt"));
+    let content = std::fs::read_to_string(&legacy_path)
+        .with_context(|| format!("failed to read {}", legacy_path.display()))?;
     content
         .lines()
         .map(parse_postings_line)
         .collect::<Result<HashMap<_, _>>>()
+}
+
+fn read_compressed_segment(
+    postings_path: &Path,
+    lexicon_path: &Path,
+) -> Result<HashMap<String, Vec<Posting>>> {
+    let bytes = std::fs::read(postings_path)
+        .with_context(|| format!("failed to read {}", postings_path.display()))?;
+    let lexicon = std::fs::read_to_string(lexicon_path)
+        .with_context(|| format!("failed to read {}", lexicon_path.display()))?;
+    let mut vocabulary = HashMap::new();
+
+    for (line_number, line) in lexicon.lines().enumerate() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 5 {
+            anyhow::bail!(
+                "invalid lexicon entry at {}:{}",
+                lexicon_path.display(),
+                line_number + 1
+            );
+        }
+
+        let offset: usize = fields[1].parse()?;
+        let byte_length: usize = fields[2].parse()?;
+        let document_frequency: usize = fields[3].parse()?;
+        let end = offset
+            .checked_add(byte_length)
+            .context("postings offset overflow")?;
+        let payload = bytes.get(offset..end).with_context(|| {
+            format!(
+                "postings range {offset}..{end} is outside {}",
+                postings_path.display()
+            )
+        })?;
+        vocabulary.insert(
+            fields[0].to_string(),
+            decode_postings(payload, document_frequency)?,
+        );
+    }
+
+    Ok(vocabulary)
 }
 
 fn read_indexed_paths(output_dir: &Path, segments: &[SegmentMeta]) -> Result<Vec<String>> {
@@ -494,6 +531,8 @@ mod tests {
 
         build_index(input.path(), output.path()).await.unwrap();
         let segments = read_manifest(output.path()).unwrap();
+        assert!(output.path().join("seg_0.postings.bin").exists());
+        assert!(output.path().join("seg_0.lexicon.tsv").exists());
         let documents = read_segment_docs(output.path(), &segments[0]).unwrap();
         let index = SearchIndex::load(output.path()).unwrap();
 

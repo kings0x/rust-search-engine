@@ -119,6 +119,28 @@
         font-size: 14px;
       }
 
+      .suggestions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        min-height: 0;
+        margin: -4px 0 16px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .suggestion {
+        padding: 5px 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface-raised);
+        color: var(--accent-strong);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
       .results { display: grid; gap: 12px; }
 
       article {
@@ -197,6 +219,7 @@
 
       <div class="stats" id="stats">Loading index statistics…</div>
       <div class="status" id="status">Enter a query to begin.</div>
+      <div class="suggestions" id="suggestions"></div>
       <section class="results" id="results" aria-live="polite"></section>
     </main>
 
@@ -206,6 +229,7 @@
       const submitButton = document.querySelector('#submit');
       const statsElement = document.querySelector('#stats');
       const statusElement = document.querySelector('#status');
+      const suggestionsElement = document.querySelector('#suggestions');
       const resultsElement = document.querySelector('#results');
 
       const formatNumber = new Intl.NumberFormat();
@@ -234,7 +258,29 @@
 
       function renderResults(payload) {
         resultsElement.replaceChildren();
+        suggestionsElement.replaceChildren();
         statusElement.textContent = `${formatNumber.format(payload.total_candidates)} candidates · ${payload.hits.length} shown · ${formatNumber.format(payload.took_micros)} µs · terms: ${payload.analyzed_terms.join(', ')}`;
+
+        if (payload.suggestions.length > 0) {
+          const label = document.createElement('span');
+          label.textContent = 'Closest indexed terms:';
+          suggestionsElement.append(label);
+
+          const replacements = new Map(payload.suggestions.map(item => [item.term, item.replacement]));
+          for (const suggestion of payload.suggestions) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'suggestion';
+            button.textContent = `${suggestion.term} → ${suggestion.replacement}`;
+            button.addEventListener('click', () => {
+              queryInput.value = payload.analyzed_terms
+                .map(term => replacements.get(term) ?? term)
+                .join(' ');
+              form.requestSubmit();
+            });
+            suggestionsElement.append(button);
+          }
+        }
 
         if (payload.hits.length === 0) {
           const empty = document.createElement('div');
@@ -272,6 +318,7 @@
 
         submitButton.disabled = true;
         statusElement.textContent = 'Searching…';
+        suggestionsElement.replaceChildren();
         resultsElement.replaceChildren();
         history.replaceState(null, '', `?q=${encodeURIComponent(query)}`);
 

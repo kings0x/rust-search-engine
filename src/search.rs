@@ -24,9 +24,16 @@ pub struct SearchHit {
 pub struct SearchResponse {
     pub query: String,
     pub analyzed_terms: Vec<String>,
+    pub suggestions: Vec<TermSuggestion>,
     pub total_candidates: usize,
     pub took_micros: u128,
     pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TermSuggestion {
+    pub term: String,
+    pub replacement: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +48,7 @@ pub struct IndexStats {
 pub struct SearchIndex {
     documents: HashMap<u32, DocMeta>,
     postings: HashMap<String, Vec<Posting>>,
+    trigram_terms: HashMap<String, Vec<String>>,
     average_document_length: f64,
     k1: f64,
     b: f64,
@@ -67,6 +75,8 @@ impl SearchIndex {
             term_postings.sort_by_key(|posting| posting.doc_id);
         }
 
+        let trigram_terms = build_trigram_index(postings.keys());
+
         let average_document_length = if documents.is_empty() {
             0.0
         } else {
@@ -80,6 +90,7 @@ impl SearchIndex {
         Ok(Self {
             documents,
             postings,
+            trigram_terms,
             average_document_length,
             k1: DEFAULT_K1,
             b: DEFAULT_B,
@@ -101,6 +112,16 @@ impl SearchIndex {
         let mut analyzed_terms = analyze(query);
         let mut seen = HashSet::new();
         analyzed_terms.retain(|term| seen.insert(term.clone()));
+        let suggestions = analyzed_terms
+            .iter()
+            .filter(|term| !self.postings.contains_key(*term))
+            .filter_map(|term| {
+                self.suggest_term(term).map(|replacement| TermSuggestion {
+                    term: term.clone(),
+                    replacement,
+                })
+            })
+            .collect();
 
         let document_count = self.documents.len() as f64;
         let mut scores: HashMap<u32, (f64, usize)> = HashMap::new();
@@ -160,11 +181,88 @@ impl SearchIndex {
         SearchResponse {
             query: query.to_string(),
             analyzed_terms,
+            suggestions,
             total_candidates,
             took_micros: started.elapsed().as_micros(),
             hits,
         }
     }
+
+    fn suggest_term(&self, term: &str) -> Option<String> {
+        let query_trigrams = trigrams(term);
+        let mut overlaps: HashMap<&str, usize> = HashMap::new();
+        for trigram in &query_trigrams {
+            if let Some(candidates) = self.trigram_terms.get(trigram) {
+                for candidate in candidates {
+                    *overlaps.entry(candidate).or_default() += 1;
+                }
+            }
+        }
+
+        overlaps
+            .into_iter()
+            .filter_map(|(candidate, overlap)| {
+                let candidate_trigram_count = trigrams(candidate).len();
+                let similarity =
+                    2.0 * overlap as f64 / (query_trigrams.len() + candidate_trigram_count) as f64;
+                let distance = edit_distance(term, candidate);
+                let maximum_distance = 2_usize.max(term.chars().count() / 3);
+                (similarity >= 0.35 && distance <= maximum_distance)
+                    .then_some((candidate, similarity, distance))
+            })
+            .max_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| right.0.cmp(left.0))
+            })
+            .map(|(candidate, _, _)| candidate.to_string())
+    }
+}
+
+fn build_trigram_index<'a>(
+    terms: impl Iterator<Item = &'a String>,
+) -> HashMap<String, Vec<String>> {
+    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+    for term in terms {
+        for trigram in trigrams(term) {
+            index.entry(trigram).or_default().push(term.clone());
+        }
+    }
+    index
+}
+
+fn trigrams(term: &str) -> HashSet<String> {
+    let padded: Vec<char> = format!("^{term}$").chars().collect();
+    if padded.len() < 3 {
+        return HashSet::from([padded.iter().collect()]);
+    }
+    padded
+        .windows(3)
+        .map(|window| window.iter().collect())
+        .collect()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = Vec::with_capacity(right.len() + 1);
+        current.push(left_index + 1);
+        for (right_index, right_character) in right.iter().enumerate() {
+            let substitution =
+                previous[right_index] + usize::from(left_character != *right_character);
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(substitution),
+            );
+        }
+        previous = current;
+    }
+
+    previous[right.len()]
 }
 
 #[cfg(test)]
@@ -215,6 +313,7 @@ mod tests {
         ]);
         let index = SearchIndex {
             documents,
+            trigram_terms: super::build_trigram_index(postings.keys()),
             postings,
             average_document_length: 100.0,
             k1: 1.2,
@@ -234,6 +333,7 @@ mod tests {
         let index = SearchIndex {
             documents: HashMap::new(),
             postings: HashMap::new(),
+            trigram_terms: HashMap::new(),
             average_document_length: 0.0,
             k1: 1.2,
             b: 0.75,
@@ -241,5 +341,31 @@ mod tests {
 
         assert!(index.search("", 10).hits.is_empty());
         assert!(index.search("missing", 10).hits.is_empty());
+    }
+
+    #[test]
+    fn suggests_a_close_vocabulary_term_for_a_typo() {
+        let postings = HashMap::from([("search".into(), vec![posting(0, 1)])]);
+        let index = SearchIndex {
+            documents: HashMap::from([(
+                0,
+                DocMeta {
+                    doc_id: 0,
+                    path: "search.md".into(),
+                    length: 1,
+                },
+            )]),
+            trigram_terms: super::build_trigram_index(postings.keys()),
+            postings,
+            average_document_length: 1.0,
+            k1: 1.2,
+            b: 0.75,
+        };
+
+        let response = index.search("serch", 10);
+
+        assert_eq!(response.suggestions.len(), 1);
+        assert_eq!(response.suggestions[0].term, "serch");
+        assert_eq!(response.suggestions[0].replacement, "search");
     }
 }
