@@ -1,9 +1,101 @@
-# Replace or extend these with queries representative of your corpus.
-rust search engine
-inverted index
-document ranking
-bm25 relevance
-posting list compression
-query latency
-spelling correction
-concurrent indexing
+# Fixed mixed-topic workload for the Wikipedia benchmark.
+ancient roman empire
+industrial revolution
+second world war
+cold war history
+history of nigeria
+french revolution
+ancient greek philosophy
+medieval european history
+american civil rights
+history of japan
+quantum mechanics
+theory of relativity
+evolution by natural selection
+human nervous system
+periodic table elements
+photosynthesis in plants
+structure of dna
+plate tectonics
+renewable energy technology
+black hole formation
+solar system planets
+climate change science
+ocean current circulation
+volcanic eruptions
+earth atmosphere layers
+amazon rainforest
+sahara desert
+mount everest
+river nile
+pacific ocean islands
+capital of australia
+largest cities in africa
+countries of south america
+geography of canada
+caribbean island nations
+william shakespeare plays
+leonardo da vinci
+classical music composers
+history of jazz
+african traditional music
+modern art movements
+academy award films
+science fiction literature
+greek mythology gods
+world heritage sites
+association football rules
+olympic games history
+basketball championship
+formula one racing
+tennis grand slam
+cricket world cup
+marathon world record
+chess world champions
+martial arts styles
+history of baseball
+computer programming languages
+artificial intelligence history
+internet protocol suite
+open source software
+database management systems
+computer network security
+operating system design
+machine learning algorithms
+world wide web
+mobile phone technology
+democratic government systems
+united nations organization
+international human rights
+global economic development
+central banking policy
+constitutional law
+political philosophy
+international trade agreements
+population growth trends
+public health systems
+infectious disease prevention
+human nutrition
+medical imaging technology
+history of vaccination
+mental health treatment
+cardiovascular system
+genetic inheritance
+space exploration missions
+apollo moon landing
+international space station
+mars exploration rover
+satellite communication
+rocket propulsion systems
+astronomy observatories
+origin of universe
+exoplanet discovery
+world religions
+christianity history
+islamic golden age
+buddhist philosophy
+hindu traditions
+traditional african religions
+ancient egyptian culture
+chinese cultural history
+indigenous peoples history
