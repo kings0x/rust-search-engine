@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,8 @@ const DATASET_API: &str = "https://datasets-server.huggingface.co/rows";
 const BATCH_SIZE: usize = 100;
 const DEFAULT_ARTICLE_COUNT: usize = 24_000;
 const DEFAULT_SEED: u64 = 0x5EED_2024;
-const MAX_ATTEMPTS: usize = 5;
+const MAX_ATTEMPTS: usize = 8;
+const REQUEST_DELAY: Duration = Duration::from_millis(1_500);
 
 #[derive(Debug, Deserialize)]
 struct RowsResponse {
@@ -112,6 +114,7 @@ async fn main() -> Result<()> {
                 println!("downloaded {accepted}/{target_count} articles");
             }
         }
+        tokio::time::sleep(REQUEST_DELAY).await;
     }
 
     let manifest = CorpusManifest {
@@ -150,16 +153,24 @@ async fn fetch_rows(client: &Client, offset: usize, length: usize) -> Result<Row
             .await
             .and_then(reqwest::Response::error_for_status);
 
+        let mut rate_limited = false;
         match result {
             Ok(response) => match response.json::<RowsResponse>().await {
                 Ok(rows) => return Ok(rows),
                 Err(error) => last_error = Some(anyhow::Error::new(error)),
             },
-            Err(error) => last_error = Some(anyhow::Error::new(error)),
+            Err(error) => {
+                rate_limited = error.status() == Some(StatusCode::TOO_MANY_REQUESTS);
+                last_error = Some(anyhow::Error::new(error));
+            }
         }
 
         if attempt < MAX_ATTEMPTS {
-            let delay = Duration::from_secs(1 << (attempt - 1));
+            let delay = if rate_limited {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_secs((1 << (attempt - 1)).min(60))
+            };
             eprintln!(
                 "request at offset {offset} failed (attempt {attempt}/{MAX_ATTEMPTS}); retrying in {}s",
                 delay.as_secs()
