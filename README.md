@@ -76,10 +76,29 @@ Generated indexes are ignored by Git. To build a clean experimental index withou
 
 ## Benchmarking
 
-Build and query in release mode. Put representative queries in `benchmark_queries.txt`, one per line, then run:
+Create a reproducible 24,000-article English Wikipedia sample with the included downloader:
 
 ```powershell
-$env:SEARCH_INDEX_DIR = ".\index_data_wikipedia"
+$env:WIKIPEDIA_OUTPUT_DIR = "E:\Datasets\wikipedia-24k"
+$env:WIKIPEDIA_ARTICLES = "24000"
+$env:WIKIPEDIA_SEED = "1592598564"
+cargo run --release --bin download_wikipedia
+```
+
+The downloader samples blocks throughout the `wikimedia/wikipedia` `20231101.en` dataset, retries temporary failures, resumes from completed files, skips truncated rows, and writes a corpus manifest containing the source, sample seed, and license notice. Article data is generated outside the repository and must not be committed.
+
+Build the corpus into a fresh index:
+
+```powershell
+$env:SEARCH_DOCUMENTS_DIR = "E:\Datasets\wikipedia-24k\documents"
+$env:SEARCH_INDEX_DIR = "E:\Datasets\wikipedia-24k-index"
+cargo run --release --bin search-engine
+```
+
+After startup reports the indexing result, stop the server with `Ctrl+C`. Put representative queries in `benchmark_queries.txt`, one per line, then run:
+
+```powershell
+$env:SEARCH_INDEX_DIR = "E:\Datasets\wikipedia-24k-index"
 $env:BENCHMARK_QUERIES_FILE = ".\benchmark_queries.txt"
 $env:BENCHMARK_REQUESTS = "100000"
 $env:BENCHMARK_WARMUP = "2000"
