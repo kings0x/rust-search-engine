@@ -109,6 +109,8 @@ cargo run --release --bin benchmark
 
 The harness reports corpus/index size, load time, workload settings, QPS, and p50/p95/p99/max latency. It calls `SearchIndex::search` directly, so it measures the ranking engine rather than HTTP, JSON serialization, or network overhead. Use an HTTP load generator separately if the claim is about end-to-end API performance.
 
+The checked-in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) records the first reproducible 24,000-article Wikipedia benchmark, including hardware, corpus provenance, all runs, and limitations.
+
 For a Wikipedia result, prepare at least 24,000 articles as individual UTF-8 files, use a fresh index directory, and preserve the exact corpus snapshot and query list. Do not describe a tiny or synthetic corpus as Wikipedia. A defensible result looks like:
 
 > On `<CPU/RAM/OS>`, in-process top-10 BM25 search over `<document count>` Wikipedia articles and `<query count>` representative queries achieved `<QPS>` at concurrency `<N>`, with `<p99>` ms p99 latency across `<request count>` measured requests after `<warmup count>` warm-up requests.
